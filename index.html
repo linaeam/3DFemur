@@ -649,21 +649,17 @@ if (typeof module !== "undefined") module.exports = { run, geometry, buildModel,
 <section id="tab-pat" hidden>
   <div class="layout" style="grid-template-columns: 340px 1fr">
     <div class="panel">
-      <p class="sect">1 · RADIO DE FACE (FACULTATIF)</p>
-      <label class="check" for="xr-file" style="display:grid;gap:6px">Charger une radio anonymisée (image JPG ou PNG)
+      <p class="sect">1 · RADIO DE FACE</p>
+      <label class="check" for="xr-file" style="display:grid;gap:6px">Charger une radio de face anonymisée (JPG ou PNG)
         <input type="file" id="xr-file" accept="image/*">
       </label>
-      <div class="seg" id="xr-mode">
-        <button data-v="scale" aria-pressed="true">Échelle</button>
-        <button data-v="dist" aria-pressed="false">Distance</button>
-        <button data-v="angle" aria-pressed="false">Angle col</button>
-        <button data-v="offset" aria-pressed="false">Offset</button>
+      <div class="seg">
+        <button class="btn" id="xr-auto" hidden disabled style="flex:1 1 100%">Analyser la radio</button>
+        <button id="xr-manual" disabled>Placer les repères à la main</button>
       </div>
-      <div class="field" id="xr-scale-row"><span>Taille réelle du repère (mm)</span><input id="xr-ref" type="number" value="25" step="0.5"></div>
-      <label for="xr-target" id="xr-target-row" hidden>La distance mesurée remplit
-        <select id="xr-target"><option value="headD">Diamètre de la tête</option><option value="shaftD">Largeur externe de la diaphyse</option><option value="canalD">Largeur du canal (isthme)</option><option value="canalLT">Largeur du canal au petit trochanter</option></select>
-      </label>
-      <p class="note" id="xr-help">Échelle : toucher les deux bords de la bille de calibration (ou d'un objet de taille connue).</p>
+      <div class="field" id="xr-scale-row"><span>Taille réelle du repère de calibration (mm)</span><input id="xr-ref" type="number" value="25" step="0.5"></div>
+      <p class="note" id="xr-help">Charger la radio : les repères sont placés automatiquement, puis toutes les mesures se remplissent. Chaque point peut être déplacé du doigt.</p>
+      <p class="note" id="xr-values" style="color:var(--text)"></p>
 
       <p class="sect">2 · MESURES DU PATIENT</p>
       <label class="field" for="p-alpha"><span>Angle cervico-diaphysaire (°)</span><input id="p-alpha" type="number" value="121" min="110" max="140"></label>
@@ -2245,36 +2241,124 @@ $("p-run").addEventListener("click", () => {
     registerPatient(p, m.metrics);
   });
 });
-// outil de mesure sur la radio
+// outil radio : repères déplaçables, analyse automatique par Claude quand la page le permet
 (function radio() {
-  const cv = $("xr"), ctx = cv.getContext("2d"); let img = null, mode = "scale", pts = [], pxmm = null;
-  const HELP = { scale: "Échelle : toucher les deux bords de la bille de calibration (ou d'un objet de taille connue).",
-    dist: "Distance : toucher deux points. La valeur en mm remplit le champ choisi.",
-    angle: "Angle col : 1) un point bas sur l'axe de la diaphyse, 2) le croisement des deux axes, 3) le centre de la tête.",
-    offset: "Offset : deux points sur l'axe de la diaphyse, puis le centre de la tête." };
-  segGroup("xr-mode", v => { mode = v; pts = []; $("xr-help").textContent = HELP[v]; $("xr-target-row").hidden = v !== "dist"; $("xr-scale-row").hidden = v !== "scale"; draw(); });
-  $("xr-file").addEventListener("change", e => { const f = e.target.files[0]; if (!f) return;
-    const im = new Image(); im.onload = () => { img = im; pts = []; $("xr-wrap").hidden = false; cv.width = im.naturalWidth; cv.height = im.naturalHeight; draw(); }; im.src = URL.createObjectURL(f); });
-  function draw() { if (!img) return; ctx.drawImage(img, 0, 0); const r = Math.max(4, cv.width / 180);
-    ctx.strokeStyle = "#efede8"; ctx.fillStyle = "#e8b4bc"; ctx.lineWidth = Math.max(2, cv.width / 500);
-    ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.stroke();
-    pts.forEach(p => { ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 7); ctx.fill(); });
-    $("xr-hud").textContent = pxmm ? `Échelle : ${fmt(pxmm, 2)} px/mm` : "Échelle non définie"; }
+  const cv = $("xr"), ctx = cv.getContext("2d");
+  let img = null, LM = null, drag = null;
+  // repères : nom, libellé, couleur
+  const DEF = [
+    ["m1", "Repère de calibration (bord 1)", "#2a7de1"], ["m2", "Repère de calibration (bord 2)", "#2a7de1"],
+    ["hc", "Centre de la tête", "#7b1e2b"], ["hr", "Bord de la tête", "#7b1e2b"],
+    ["n1", "Milieu du col", "#7b1e2b"],
+    ["s1", "Axe diaphysaire (haut)", "#1f8a5b"], ["s2", "Axe diaphysaire (bas)", "#1f8a5b"],
+    ["o1", "Corticale externe latérale (10 cm sous le petit trochanter)", "#d48a1c"], ["o2", "Corticale externe médiale", "#d48a1c"],
+    ["c1", "Canal, bord latéral (même niveau)", "#8e44ad"], ["c2", "Canal, bord médial", "#8e44ad"],
+    ["l1", "Canal au petit trochanter, bord latéral", "#16a2b8"], ["l2", "Canal au petit trochanter, bord médial", "#16a2b8"],
+  ];
+  const LBL = Object.fromEntries(DEF.map(d => [d[0], d]));
+  const say = t => { $("xr-help").textContent = t; };
   const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
-  const setField = (k, v) => { $("p-" + k).value = (Math.round(v * 10) / 10).toString(); derived(); };
-  cv.addEventListener("pointerdown", ev => { if (!img) return; const r = cv.getBoundingClientRect();
-    pts.push([(ev.clientX - r.left) / r.width * cv.width, (ev.clientY - r.top) / r.height * cv.height]);
-    const need = mode === "scale" || mode === "dist" ? 2 : 3;
-    if (pts.length === need) {
-      if (mode === "scale") { pxmm = dist(pts[0], pts[1]) / parseFloat($("xr-ref").value); $("xr-help").textContent = `Échelle définie : ${fmt(pxmm, 2)} px/mm. Choisir ensuite Distance, Angle col ou Offset.`; }
-      else if (mode === "angle") { const a = [pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]], b = [pts[2][0] - pts[1][0], pts[2][1] - pts[1][1]];
-        const ang = Math.acos((a[0] * b[0] + a[1] * b[1]) / (Math.hypot(...a) * Math.hypot(...b))) * 180 / Math.PI; setField("alpha", ang); $("xr-help").textContent = `Angle cervico-diaphysaire : ${fmt(ang, 1)}°.`; }
-      else if (!pxmm) $("xr-help").textContent = "Définir d'abord l'échelle avec le repère de taille connue.";
-      else if (mode === "dist") { const v = dist(pts[0], pts[1]) / pxmm; setField($("xr-target").value, v); $("xr-help").textContent = `${fmt(v, 1)} mm reportés dans « ${$("xr-target").selectedOptions[0].text} ».`; }
-      else { const [a, b, c] = pts; const v = Math.abs((b[0] - a[0]) * (a[1] - c[1]) - (a[0] - c[0]) * (b[1] - a[1])) / dist(a, b) / pxmm; setField("offset", v); $("xr-help").textContent = `Offset fémoral : ${fmt(v, 1)} mm.`; }
-      draw(); setTimeout(() => { pts = []; draw(); }, 900); return; }
-    draw(); });
+  function template(W, H, headLeft) {   // position de départ approximative, à ajuster à la main
+    const f = (x, y) => [headLeft ? x * W : (1 - x) * W, y * H];
+    return { m1: f(0.80, 0.10), m2: f(0.86, 0.10), hc: f(0.32, 0.22), hr: f(0.32, 0.31), n1: f(0.42, 0.30),
+      s1: f(0.55, 0.45), s2: f(0.55, 0.85), o1: f(0.62, 0.70), o2: f(0.48, 0.70), c1: f(0.585, 0.70), c2: f(0.515, 0.70),
+      l1: f(0.62, 0.45), l2: f(0.47, 0.45) };
+  }
+  function compute() {
+    if (!LM) return;
+    const ref = parseFloat($("xr-ref").value);
+    const pxmm = LM.m1 && LM.m2 && ref > 0 ? dist(LM.m1, LM.m2) / ref : null;
+    // angle cervico-diaphysaire : axe du col (vers la tête) et axe diaphysaire (vers le bas)
+    const a = [LM.hc[0] - LM.n1[0], LM.hc[1] - LM.n1[1]], b = [LM.s2[0] - LM.s1[0], LM.s2[1] - LM.s1[1]];
+    const ang = Math.acos((a[0] * b[0] + a[1] * b[1]) / (Math.hypot(...a) * Math.hypot(...b))) * 180 / Math.PI;
+    const side = LM.hc[0] < (LM.s1[0] + LM.s2[0]) / 2 ? "droit" : "gauche";   // incidence de face : tête à gauche de l'image = côté droit du patient
+    const set = (k, v) => { $("p-" + k).value = (Math.round(v * 10) / 10).toString(); };
+    set("alpha", ang); $("p-side").value = side; $("p-side").dispatchEvent(new Event("change"));
+    let txt = `Angle cervico-diaphysaire ${fmt(ang, 1)}° · fémur ${side}`;
+    if (pxmm) {
+      const off = Math.abs((LM.s2[0] - LM.s1[0]) * (LM.s1[1] - LM.hc[1]) - (LM.s1[0] - LM.hc[0]) * (LM.s2[1] - LM.s1[1])) / dist(LM.s1, LM.s2) / pxmm;
+      const vals = { offset: off, headD: 2 * dist(LM.hc, LM.hr) / pxmm, shaftD: dist(LM.o1, LM.o2) / pxmm, canalD: dist(LM.c1, LM.c2) / pxmm, canalLT: dist(LM.l1, LM.l2) / pxmm };
+      for (const [k, v] of Object.entries(vals)) set(k, v);
+      txt += ` · offset ${fmt(vals.offset, 1)} mm · tête Ø ${fmt(vals.headD, 1)} mm · diaphyse ${fmt(vals.shaftD, 1)} mm · canal ${fmt(vals.canalD, 1)} mm · canal au petit trochanter ${fmt(vals.canalLT, 1)} mm`;
+    } else txt += " · placer le repère de calibration pour obtenir les valeurs en mm";
+    $("xr-values").textContent = txt;
+    derived();
+  }
+  function draw() {
+    if (!img) return;
+    ctx.drawImage(img, 0, 0);
+    if (!LM) return;
+    const r = Math.max(5, cv.width / 140), lw = Math.max(2, cv.width / 600);
+    ctx.lineWidth = lw;
+    const line = (p, q, c) => { ctx.strokeStyle = c; ctx.beginPath(); ctx.moveTo(...p); ctx.lineTo(...q); ctx.stroke(); };
+    if (LM.m1 && LM.m2) line(LM.m1, LM.m2, "#2a7de1");
+    ctx.strokeStyle = "#7b1e2b"; ctx.beginPath(); ctx.arc(LM.hc[0], LM.hc[1], dist(LM.hc, LM.hr), 0, 7); ctx.stroke();
+    line(LM.hc, LM.n1, "#7b1e2b");
+    const d = [LM.s2[0] - LM.s1[0], LM.s2[1] - LM.s1[1]];
+    line([LM.s1[0] - d[0] * 0.3, LM.s1[1] - d[1] * 0.3], [LM.s2[0] + d[0] * 0.1, LM.s2[1] + d[1] * 0.1], "#1f8a5b");
+    line(LM.o1, LM.o2, "#d48a1c"); line(LM.c1, LM.c2, "#8e44ad"); line(LM.l1, LM.l2, "#16a2b8");
+    for (const [k, p] of Object.entries(LM)) { if (!p) continue;
+      ctx.fillStyle = LBL[k][2]; ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 7); ctx.fill();
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = lw / 1.5; ctx.stroke(); ctx.lineWidth = lw; }
+  }
+  const toImg = ev => { const b = cv.getBoundingClientRect(); return [(ev.clientX - b.left) / b.width * cv.width, (ev.clientY - b.top) / b.height * cv.height]; };
+  cv.addEventListener("pointerdown", ev => { if (!LM) return; const p = toImg(ev);
+    let best = null, bd = Math.max(25, cv.width / 30);
+    for (const [k, q] of Object.entries(LM)) if (q) { const d = dist(p, q); if (d < bd) { bd = d; best = k; } }
+    if (best) { drag = best; cv.setPointerCapture(ev.pointerId); say("Repère : " + LBL[best][1]); ev.preventDefault(); } });
+  cv.addEventListener("pointermove", ev => { if (!drag) return; LM[drag] = toImg(ev); draw(); compute(); });
+  cv.addEventListener("pointerup", () => { drag = null; });
+  $("xr-ref").addEventListener("input", compute);
+
+  $("xr-file").addEventListener("change", e => { const f = e.target.files[0]; if (!f) return;
+    const im = new Image(); im.onload = () => { img = im; LM = null; $("xr-wrap").hidden = false;
+      cv.width = im.naturalWidth; cv.height = im.naturalHeight; draw(); $("xr-auto").disabled = false; $("xr-manual").disabled = false;
+      say(SAMPLE ? "Radio chargée. Appuyer sur « Analyser la radio » : les valeurs se rempliront toutes seules." : "Radio chargée. L'analyse automatique n'est pas disponible dans cette version du site : appuyer sur « Placer les repères » puis les faire glisser sur la radio.");
+      if (SAMPLE) runAuto(); };
+    im.src = URL.createObjectURL(f); });
+  $("xr-manual").addEventListener("click", () => { if (!img) return; LM = template(cv.width, cv.height, true); draw(); compute();
+    say("Faire glisser chaque point sur le bon repère anatomique. Les valeurs se mettent à jour en direct."); });
+
+  // analyse automatique par Claude (vision)
+  let SAMPLE = null;
+  (async () => { try { if (window.claude && window.claude.use) { const s = await window.claude.use("sample");
+    if (s && (await s.limits()).images) { SAMPLE = s; $("xr-auto").hidden = false; } } } catch (e) {} })();
+  async function runAuto() {
+    if (!SAMPLE || !img) return;
+    $("xr-auto").disabled = true; say("Analyse de la radio en cours (environ 20 à 40 secondes)…");
+    try {
+      // image réduite à 1600 px de large au plus
+      const k = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight));
+      const c2 = document.createElement("canvas"); c2.width = Math.round(img.naturalWidth * k); c2.height = Math.round(img.naturalHeight * k);
+      c2.getContext("2d").drawImage(img, 0, 0, c2.width, c2.height);
+      const blob = await new Promise(r => c2.toBlob(r, "image/jpeg", 0.92));
+      const prompt = `Tu reçois une radiographie de face (incidence antéro-postérieure) de hanche ou de bassin, de ${c2.width} × ${c2.height} pixels (origine en haut à gauche, x vers la droite, y vers le bas).
+Si plusieurs hanches sont visibles, analyse la hanche ${$("p-side").value === "gauche" ? "gauche du patient (à droite de l'image)" : "droite du patient (à gauche de l'image)"} sauf si une seule hanche est entière ; dans ce cas, analyse celle-là.
+Repère ces points anatomiques en pixels, aussi précisément que possible :
+- m1, m2 : les deux extrémités d'un diamètre de la bille de calibration (sphère métallique très blanche, souvent hors de l'os) ; null si aucune n'est visible ;
+- hc : centre de la tête fémorale ; hr : un point sur le contour de la tête ;
+- n1 : milieu de l'axe du col fémoral, à mi-chemin entre la tête et la diaphyse ;
+- s1 et s2 : deux points sur l'axe de la diaphyse fémorale (milieu entre les corticales), s1 juste sous le petit trochanter, s2 le plus bas possible ;
+- o1, o2 : bords externes des corticales latérale et médiale, 10 cm sous le petit trochanter (ou le plus bas visible) ;
+- c1, c2 : bords du canal médullaire (faces internes des corticales) au même niveau ;
+- l1, l2 : bords du canal médullaire au niveau du milieu du petit trochanter.
+Réponds uniquement en JSON : {"side":"droit"|"gauche","m1":[x,y]|null,"m2":[x,y]|null,"hc":[x,y],"hr":[x,y],"n1":[x,y],"s1":[x,y],"s2":[x,y],"o1":[x,y],"o2":[x,y],"c1":[x,y],"c2":[x,y],"l1":[x,y],"l2":[x,y],"confiance":"faible"|"moyenne"|"bonne","remarque":"une phrase en français"}.`;
+      const res = await SAMPLE.json(prompt, { images: [blob], modelTier: "complex" });
+      const out = {};
+      for (const [key] of DEF) { const v = res[key]; out[key] = Array.isArray(v) && v.length === 2 ? [v[0] / k, v[1] / k] : null; }
+      for (const req of ["hc", "hr", "n1", "s1", "s2", "o1", "o2", "c1", "c2", "l1", "l2"]) if (!out[req]) throw new Error("repère « " + LBL[req][1] + " » non trouvé");
+      LM = out; draw(); compute();
+      say(`Analyse terminée (confiance ${res.confiance || "inconnue"}). ${res.remarque || ""} Vérifier chaque point et le faire glisser si besoin : les valeurs se mettent à jour en direct.` +
+        (out.m1 ? "" : " Aucun repère de calibration détecté : placer les deux points bleus sur un objet de taille connue et indiquer sa taille."));
+      if (!out.m1) { LM.m1 = [cv.width * 0.8, cv.height * 0.1]; LM.m2 = [cv.width * 0.86, cv.height * 0.1]; draw(); compute(); }
+    } catch (e) {
+      say("L'analyse automatique n'a pas abouti (" + (e.message || e.code || "erreur") + "). Appuyer sur « Placer les repères » pour les placer à la main.");
+    }
+    $("xr-auto").disabled = false;
+  }
+  $("xr-auto").addEventListener("click", runAuto);
 })();
+
 bindView(() => { simDraw(); patDraw(); });
 
 // ================= 3 · SCANNER (modèle patient) =================
